@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:async';
+import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -483,6 +484,21 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
   int _dockingOptionSyncSerial = 0;
   int _dragEpoch = 0;
 
+  // ---- Independent UU-style floating ball -------------------------------
+  // Its own OverlayEntry so it can be dragged anywhere and auto-dim. It is
+  // injected from this State, whose context already lives in the per-session
+  // Overlay (see remote_page.dart), so the ball hides with relative mouse
+  // mode and is isolated per tab automatically.
+  OverlayEntry? _fabOverlayEntry;
+  final _fabOffset = Offset.zero.obs;
+  final _fabDimmed = false.obs;
+  final _fabDragging = false.obs;
+  final _fabCollapsed = false.obs;
+  Timer? _fabHideTimer;
+  Size _fabScreenSize = const Size(0, 0);
+  int _fabSetupRetries = 0;
+  static const String _kFabStateKey = 'uu-floating-ball-state';
+
   int get windowId => stateGlobal.windowId;
 
   void _setFullscreen(bool v) {
@@ -645,6 +661,10 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
       widget.state.init(widget.ffi.sessionId);
     });
 
+    // Mount the independent floating ball after the first frame, when
+    // Overlay.of(context) resolves to this session's Overlay.
+    WidgetsBinding.instance.addPostFrameCallback((_) => _setupFloatingBall());
+
     _debouncerHide = Debouncer<int>(
       Duration(milliseconds: 5000),
       onChanged: _debouncerHideProc,
@@ -679,6 +699,9 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
   dispose() {
     ++_dockingOptionSyncSerial;
     widget.onEnterOrLeaveImageCleaner(identityHashCode(this));
+    _fabHideTimer?.cancel();
+    _fabOverlayEntry?.remove();
+    _fabOverlayEntry = null;
     super.dispose();
   }
 
@@ -800,9 +823,457 @@ class _RemoteToolbarState extends State<RemoteToolbar> {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Independent floating ball (UU style).
+  //
+  // Hosted in its own OverlayEntry, so it is independent of the toolbar's
+  // docking/collapse state. Supports free dragging, left/right edge snapping
+  // and auto-dim after a period of inactivity. Taps open the exact same
+  // control-center menu as the toolbar entry (_buildControlCenter).
+  // ---------------------------------------------------------------------------
+  void _setupFloatingBall() {
+    if (!mounted || _fabOverlayEntry != null) return;
+    // Peer info arrives shortly after connecting. Until then the toolbar is
+    // not inside the session Overlay; retry a few times so we insert into the
+    // right Overlay instead of the app root Overlay.
+    if (pi.isSet.isFalse && _fabSetupRetries++ < 20) {
+      Future.delayed(const Duration(milliseconds: 500), () {
+        if (mounted) _setupFloatingBall();
+      });
+      return;
+    }
+    final overlay = Overlay.of(context);
+    if (overlay == null) return;
+
+    final initialSize =
+        MediaQuery.maybeOf(overlay.context)?.size ?? const Size(1200, 800);
+    _fabScreenSize = initialSize;
+    _restoreFloatingBall(initialSize);
+
+    _fabOverlayEntry = OverlayEntry(builder: (ctx) {
+      final screenSize = MediaQuery.maybeOf(ctx)?.size ?? _fabScreenSize;
+      _fabScreenSize = screenSize;
+      final minX = 12.0;
+      final minY = 12.0;
+      final maxX = screenSize.width - _ToolbarTheme.buttonSize - 12;
+      final maxY = screenSize.height - _ToolbarTheme.buttonSize - 12;
+      return Obx(() {
+        // Clamp here too, so shrinking the window cannot push the ball offscreen.
+        final raw = _fabOffset.value;
+        final pos = Offset(
+          raw.dx.clamp(minX, maxX).toDouble(),
+          raw.dy.clamp(minY, maxY).toDouble(),
+        );
+        // Collapsed: park a small handle flush against the nearest side edge,
+        // UU-style, instead of leaving the full ball on screen.
+        final collapsed = _fabCollapsed.value;
+        final atLeft = pos.dx < screenSize.width / 2;
+        final left = collapsed
+            ? (atLeft ? 0.0 : screenSize.width - 16)
+            : pos.dx;
+        final top = collapsed
+            ? pos.dy.clamp(minY, screenSize.height - 44 - 12).toDouble()
+            : pos.dy;
+        return Positioned(
+          left: left,
+          top: top,
+          child: AnimatedSwitcher(
+            duration: const Duration(milliseconds: 200),
+            child: collapsed
+                ? _buildFabHandle(atLeft: atLeft)
+                : AnimatedOpacity(
+                    key: const ValueKey('fab-ball'),
+                    opacity: _fabDimmed.value ? 0.35 : 1.0,
+                    duration: const Duration(milliseconds: 250),
+                    child: GestureDetector(
+                      // translucent keeps the inner SubmenuButton's tap usable
+                      // while the detector still competes for drag gestures.
+                      behavior: HitTestBehavior.translucent,
+                      onPanStart: (_) {
+                        _fabDragging.value = true;
+                        _wakeFloatingBall();
+                      },
+                      onPanUpdate: (d) {
+                        // Read the latest Rx value: the closure's captured `pos`
+                        // is from the previous build and lags rapid drag events.
+                        final cur = _fabOffset.value;
+                        _fabOffset.value = Offset(
+                          (cur.dx + d.delta.dx).clamp(minX, maxX).toDouble(),
+                          (cur.dy + d.delta.dy).clamp(minY, maxY).toDouble(),
+                        );
+                      },
+                      onPanEnd: (_) {
+                        _fabDragging.value = false;
+                        // Dropping close to a side edge collapses the ball,
+                        // matching UU's "slide to edge to shrink" behaviour.
+                        final x = _fabOffset.value.dx;
+                        final nearEdge = x <= 28 ||
+                            x >= screenSize.width -
+                                _ToolbarTheme.buttonSize -
+                                28;
+                        _snapFloatingBall();
+                        if (nearEdge) _fabCollapsed.value = true;
+                        _persistFloatingBall();
+                        _scheduleFloatingBallAutoHide();
+                      },
+                      child: _buildControlCenter(ctx),
+                    ),
+                  ),
+          ),
+        );
+      });
+    });
+    overlay.insert(_fabOverlayEntry!);
+    _scheduleFloatingBallAutoHide();
+  }
+
+  // Small edge handle shown when the floating ball is collapsed. Tapping it
+  // restores the full ball. Rounded on the side facing the screen centre.
+  Widget _buildFabHandle({required bool atLeft}) {
+    final radius = BorderRadius.horizontal(
+      left: atLeft ? Radius.zero : const Radius.circular(8),
+      right: atLeft ? const Radius.circular(8) : Radius.zero,
+    );
+    return SizedBox(
+      key: const ValueKey('fab-handle'),
+      width: 16,
+      height: 44,
+      child: Material(
+        type: MaterialType.transparency,
+        child: InkWell(
+          onTap: () {
+            _fabCollapsed.value = false;
+            _wakeFloatingBall();
+            _persistFloatingBall();
+          },
+          borderRadius: radius,
+          child: Ink(
+            decoration: BoxDecoration(color: MyTheme.accent, borderRadius: radius),
+            child: Icon(
+              atLeft ? Icons.chevron_right : Icons.chevron_left,
+              color: Colors.white,
+              size: 14,
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  // Persist ball position + collapsed flag across sessions via RustDesk's
+  // local flutter-options store (same mechanism ToolbarState uses for pin).
+  void _persistFloatingBall() {
+    try {
+      final p = _fabOffset.value;
+      bind.setLocalFlutterOption(
+        k: _kFabStateKey,
+        v: jsonEncode({
+          'x': p.dx,
+          'y': p.dy,
+          'collapsed': _fabCollapsed.value,
+        }),
+      );
+    } catch (e) {
+      debugPrint('persist floating ball state failed: $e');
+    }
+  }
+
+  void _restoreFloatingBall(Size size) {
+    // Default to the upper-right area when there is no saved state.
+    _fabOffset.value = Offset(
+      size.width - _ToolbarTheme.buttonSize - 12,
+      size.height * 0.32,
+    );
+    final s = bind.getLocalFlutterOption(k: _kFabStateKey);
+    if (s.isEmpty) return;
+    try {
+      final m = jsonDecode(s);
+      if (m is! Map<String, dynamic>) return;
+      final x = (m['x'] as num?)?.toDouble();
+      final y = (m['y'] as num?)?.toDouble();
+      if (x != null && y != null) {
+        _fabOffset.value = Offset(
+          x.clamp(12.0, size.width - _ToolbarTheme.buttonSize - 12).toDouble(),
+          y.clamp(12.0, size.height - _ToolbarTheme.buttonSize - 12).toDouble(),
+        );
+      }
+      _fabCollapsed.value = m['collapsed'] == true;
+    } catch (e) {
+      debugPrint('restore floating ball state failed: $e');
+    }
+  }
+
+  void _snapFloatingBall() {
+    final x = _fabOffset.value.dx;
+    final targetX = x < _fabScreenSize.width / 2
+        ? 12.0
+        : _fabScreenSize.width - _ToolbarTheme.buttonSize - 12;
+    _fabOffset.value = Offset(targetX, _fabOffset.value.dy);
+  }
+
+  void _wakeFloatingBall() {
+    _fabDimmed.value = false;
+    _fabHideTimer?.cancel();
+  }
+
+  void _scheduleFloatingBallAutoHide() {
+    _fabHideTimer?.cancel();
+    _fabHideTimer = Timer(const Duration(seconds: 8), () {
+      if (mounted && !_fabDragging.value) _fabDimmed.value = true;
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // UU-style floating control center.
+  // A single round entry button whose popup is regrouped into the same first
+  // level columns as UU Remote: Screen / Quality / Tools / Peripherals / More.
+  // Every item reuses an already-tested toolbar function or widget from this
+  // file, so no new remote API is introduced.
+  // ---------------------------------------------------------------------------
+  Widget _buildControlCenter(BuildContext context) {
+    final ffi = widget.ffi;
+    final sessionId = ffi.sessionId;
+    final id = widget.id;
+
+    Widget groupLabel(String text) => Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+          child: Text(
+            translate(text),
+            style: TextStyle(
+              fontSize: 12,
+              color: Theme.of(context).hintColor,
+            ),
+          ),
+        );
+
+    // Screen: view style + monitor switching. Only plain menu items are used
+    // here (no nested MenuBar widgets), so the popup renders reliably.
+    List<Widget> screenGroup() {
+      final list = <Widget>[groupLabel('Screen')];
+      list.add(futureBuilder(
+        future: toolbarViewStyle(context, id, ffi),
+        hasData: (data) {
+          final v = data as List<TRadioMenu<String>>;
+          return _SubmenuButton(
+            ffi: ffi,
+            child: Text(translate('View Style')),
+            menuChildren: v
+                .map((e) => RdoMenuButton<String>(
+                    value: e.value,
+                    groupValue: e.groupValue,
+                    onChanged: e.onChanged,
+                    child: e.child,
+                    ffi: ffi))
+                .toList(),
+          );
+        },
+      ));
+      // Monitor switch: one item per display, calling the same bind API the
+      // stock toolbar uses.
+      list.add(Obx(() {
+        final displays = pi.displays;
+        if (displays.length < 2) return const Offstage();
+        final items = <Widget>[];
+        for (var i = 0; i < displays.length; i++) {
+          items.add(MenuButton(
+            ffi: ffi,
+            child: Text("${translate('Screen')} ${i + 1}"),
+            onPressed: () => bind.sessionSwitchDisplay(
+              isDesktop: isDesktop,
+              sessionId: sessionId,
+              value: Int32List.fromList([i]),
+            ),
+          ));
+        }
+        return _SubmenuButton(
+          ffi: ffi,
+          child: Text(translate('Switch display')),
+          menuChildren: items,
+        );
+      }));
+      return list;
+    }
+
+    // Quality: image quality + codec, both from the shared toolbar helpers.
+    List<Widget> qualityGroup() {
+      return [
+        groupLabel('Image Quality'),
+        futureBuilder(
+          future: toolbarImageQuality(context, id, ffi),
+          hasData: (data) {
+            final v = data as List<TRadioMenu<String>>;
+            return _SubmenuButton(
+              ffi: ffi,
+              child: Text(translate('Image Quality')),
+              menuChildren: v
+                  .map((e) => RdoMenuButton<String>(
+                      value: e.value,
+                      groupValue: e.groupValue,
+                      onChanged: e.onChanged,
+                      child: e.child,
+                      ffi: ffi))
+                  .toList(),
+            );
+          },
+        ),
+        futureBuilder(
+          future: toolbarCodec(context, id, ffi),
+          hasData: (data) {
+            final v = data as List<TRadioMenu<String>>;
+            if (v.isEmpty) return const Offstage();
+            return _SubmenuButton(
+              ffi: ffi,
+              child: Text(translate('Codec')),
+              menuChildren: v
+                  .map((e) => RdoMenuButton<String>(
+                      value: e.value,
+                      groupValue: e.groupValue,
+                      onChanged: e.onChanged,
+                      child: e.child,
+                      ffi: ffi))
+                  .toList(),
+            );
+          },
+        ),
+      ];
+    }
+
+    // Tools: chat / voice call / recording / clipboard keystrokes, all from
+    // helpers already used by the desktop toolbar.
+    List<Widget> toolsGroup() {
+      final list = <Widget>[groupLabel('Tools')];
+      if (!isWeb) {
+        list.add(MenuButton(
+          ffi: ffi,
+          child: Text(translate('Text chat')),
+          onPressed: () => ffi.chatModel.toggleChatOverlay(),
+        ));
+        list.add(MenuButton(
+          ffi: ffi,
+          child: Text(translate('Voice call')),
+          onPressed: () => bind.sessionRequestVoiceCall(sessionId: sessionId),
+        ));
+      }
+      if (!isWeb) {
+        list.add(MenuButton(
+          ffi: ffi,
+          child: Text(translate('Start / Stop recording')),
+          onPressed: () => ffi.recordingModel.toggle(),
+        ));
+      }
+      // Control actions (Ctrl+Alt+Del, lock, clipboard keystrokes, ...).
+      final controls = toolbarControls(context, id, ffi)
+          .where((e) => !e.divider)
+          .map((e) => MenuButton(
+                ffi: ffi,
+                child: e.getChild(),
+                onPressed: e.onPressed,
+                trailingIcon: e.trailingIcon,
+              ) as Widget)
+          .toList();
+      if (controls.isNotEmpty) {
+        list.add(_SubmenuButton(
+          ffi: ffi,
+          child: Text(translate('Control Actions')),
+          menuChildren: controls,
+        ));
+      }
+      return list;
+    }
+
+    // Peripherals: keyboard/mouse toggles, no Provider dependency.
+    List<Widget> peripheralsGroup() {
+      final toggles = toolbarKeyboardToggles(ffi)
+          .map((e) => CkbMenuButton(
+                value: e.value,
+                onChanged: e.onChanged,
+                child: e.child,
+                ffi: ffi,
+              ) as Widget)
+          .toList();
+      return [groupLabel('Peripherals'), ...toggles];
+    }
+
+    // More: toolbar pin / collapse / hide, plus fullscreen.
+    List<Widget> moreGroup() {
+      return [
+        groupLabel('More'),
+        Obx(() => CkbMenuButton(
+              value: widget.state.pin,
+              onChanged: (_) => widget.state.switchPin(),
+              child: Text(translate('Pin Toolbar')),
+              ffi: ffi,
+            )),
+        Obx(() => MenuButton(
+              ffi: ffi,
+              child: Text(translate(collapse.isTrue
+                  ? 'Expand Toolbar'
+                  : 'Collapse Toolbar')),
+              onPressed: () => widget.state.switchCollapse(sessionId),
+            )),
+        MenuButton(
+          ffi: ffi,
+          child: Text(translate('Fullscreen')),
+          onPressed: () => _setFullscreen(!stateGlobal.fullscreen.value),
+        ),
+        MenuButton(
+          ffi: ffi,
+          child: Text(translate('Collapse floating ball')),
+          onPressed: () {
+            _fabCollapsed.value = true;
+            _snapFloatingBall();
+            _persistFloatingBall();
+          },
+        ),
+      ];
+    }
+
+    // Round blue floating ball used as the entry icon.
+    final fab = SizedBox(
+      width: _ToolbarTheme.buttonSize,
+      height: _ToolbarTheme.buttonSize,
+      child: Material(
+        type: MaterialType.transparency,
+        child: Ink(
+          decoration: BoxDecoration(
+            color: MyTheme.accent,
+            shape: BoxShape.circle,
+          ),
+          child: Icon(
+            Icons.apps_rounded,
+            color: Colors.white,
+            size: 18,
+          ),
+        ),
+      ),
+    );
+
+    return _IconSubmenuButton(
+      tooltip: 'Control Center',
+      icon: fab,
+      color: Colors.transparent,
+      hoverColor: Colors.transparent,
+      ffi: ffi,
+      menuStyle: _ToolbarTheme.defaultMenuStyle(context),
+      menuChildrenGetter: (_) => [
+        ...screenGroup(),
+        Divider(),
+        ...qualityGroup(),
+        Divider(),
+        ...toolsGroup(),
+        Divider(),
+        ...peripheralsGroup(),
+        Divider(),
+        ...moreGroup(),
+      ],
+    );
+  }
+
   Widget _buildToolbar(
       BuildContext context, _ToolbarEdge edge, bool isHorizontal) {
     final List<Widget> toolbarItems = [];
+    // UU-style control center is the first (leftmost) entry.
+    toolbarItems.add(_buildControlCenter(context));
     toolbarItems.add(_PinMenu(state: widget.state));
     toolbarItems.add(Obx(() {
       final privacyModeState = PrivacyModeState.find(widget.id);
